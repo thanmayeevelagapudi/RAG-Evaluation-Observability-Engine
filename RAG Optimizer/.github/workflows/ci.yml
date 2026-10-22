@@ -1,0 +1,136 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  # ── Unit tests (no live infra required) ────────────────────────────────────
+  unit-tests:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          # Install CPU-only torch to avoid the 2 GB CUDA wheels
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install -r requirements.txt
+
+      - name: Run unit tests
+        run: pytest tests/ -q --tb=short
+
+  # ── Docker build smoke-test ────────────────────────────────────────────────
+  docker-build:
+    name: Docker Build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build image
+        run: docker build -f infra/Dockerfile -t adaptive-rag:ci .
+
+  # ── Deploy to Azure Container Apps (main branch only) ─────────────────────
+  # Secrets required in GitHub → Settings → Environments → production:
+  #   AZURE_CREDENTIALS   (output of: az ad sp create-for-rbac --role contributor)
+  # Variables required:
+  #   AZURE_ACR_NAME      (e.g. adaptiveragacr)
+  #   AZURE_RESOURCE_GROUP (e.g. adaptive-rag-rg)
+  deploy:
+    name: Deploy to Azure
+    runs-on: ubuntu-latest
+    needs: [unit-tests, docker-build]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Azure login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Build and push to Azure Container Registry
+        run: |
+          az acr build \
+            --registry ${{ vars.AZURE_ACR_NAME }} \
+            --image adaptive-rag:${{ github.sha }} \
+            --file infra/Dockerfile \
+            .
+
+      - name: Deploy to Azure Container Apps
+        uses: azure/container-apps-deploy-action@v1
+        with:
+          resourceGroup: ${{ vars.AZURE_RESOURCE_GROUP }}
+          containerAppName: adaptive-rag
+          imageToDeploy: ${{ vars.AZURE_ACR_NAME }}.azurecr.io/adaptive-rag:${{ github.sha }}
+
+  # ── Benchmark regression gate (runs when a baseline is committed) ──────────
+  benchmark-gate:
+    name: Benchmark Regression Gate
+    runs-on: ubuntu-latest
+    needs: unit-tests
+    if: ${{ hashFiles('benchmarks/baselines/nfcorpus.json') != '' }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          # Install CPU-only torch to avoid large CUDA wheels
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install -r requirements.txt
+
+      - name: Start retrieval infra
+        run: docker compose up -d qdrant elasticsearch postgres redis
+
+      - name: Wait for infra readiness
+        run: |
+          for i in {1..40}; do
+            QDRANT_OK=$(curl -sS -o /dev/null -w "%{http_code}" http://localhost:6333/collections || true)
+            ES_OK=$(curl -sS "http://localhost:9200/_cluster/health?wait_for_status=yellow&timeout=1s" | grep -c '"status"' || true)
+            PG_OK=$(docker compose exec -T postgres pg_isready -U rag -d rag >/dev/null 2>&1; echo $?)
+            REDIS_OK=$(docker compose exec -T redis redis-cli ping 2>/dev/null | grep -c PONG || true)
+
+            if [ "$QDRANT_OK" = "200" ] && [ "$ES_OK" -gt 0 ] && [ "$PG_OK" = "0" ] && [ "$REDIS_OK" -gt 0 ]; then
+              echo "Infra is ready"
+              exit 0
+            fi
+            sleep 3
+          done
+          echo "Infra readiness timed out"
+          docker compose ps
+          exit 1
+
+      - name: Seed benchmark corpus
+        run: python scripts/seed_corpus.py
+
+      - name: Run benchmark gate
+        run: make benchmark-ci DATASET=nfcorpus MAX_QUERIES=50
+
+      - name: Upload benchmark artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-results
+          path: benchmarks/results/*
+          if-no-files-found: warn
+
+      - name: Tear down infra
+        if: always()
+        run: docker compose down -v
